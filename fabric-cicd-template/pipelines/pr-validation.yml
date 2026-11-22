@@ -1,0 +1,34 @@
+# =============================================================================
+#  Microsoft Fabric - PR validation pipeline (never deploys)          TEMPLATE
+# =============================================================================
+#  Add as a required Build Validation branch policy on BOTH develop and main:
+#    Repos -> Branches -> develop/main -> ... -> Branch policies -> Build validation -> + -> this pipeline
+#
+#  Runs on every PR update:
+#    1. branch rules  (main <- develop or hotfix/*; develop <- feature/*, fix/*, bugfix/*, hotfix/*, main)
+#    3. static validation of the Fabric items and parameter.yml
+#    4. offline dry-run deploy to fake TEST and PROD workspaces
+#    5. results in the PR's Tests tab
+#  No secrets and no Fabric access needed.
+# =============================================================================
+
+trigger: none
+pr: none   # Azure Repos uses the branch policy, not this setting
+
+variables:
+  # >>> CHANGE (optional): keep these the same as in cd-pipeline.yml.
+  - name: fabricFolder
+    value: workspace
+  - name: agentImage
+    value: ubuntu-latest
+  - name: pythonVersion
+    value: '3.11'
+
+stages:
+  - template: templates/build-stage.yml
+    parameters:
+      publishArtifact: false
+      checkPrBranches: true
+      fabricFolder: ${{ variables.fabricFolder }}
+      agentImage: ${{ variables.agentImage }}
+      pythonVersion: ${{ variables.pythonVersion }}

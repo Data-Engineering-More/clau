@@ -1,0 +1,160 @@
+# =============================================================================
+#  Deploy stage - one per environment, called by cd-pipeline.yml
+# =============================================================================
+#    Gate         Approval job (agentless ManualValidation) when requireApproval = true.
+#                 Named approvers get an email; the run waits; reject or timeout = stop.
+#    Preflight    service principal can open the workspace; workspace is on a capacity
+#    Deploy       fabric-cicd publish with parameter.yml applied
+#    Smoke check  every repo item now exists in the workspace
+#    Post-deploy  OPTIONAL: run a pipeline/notebook in the workspace and wait for success
+#    Tag          OPTIONAL (PROD): tag the released commit
+#  No values to change in this file - set them in cd-pipeline.yml.
+# =============================================================================
+
+parameters:
+  - name: envName                    # DEV | TEST | PROD (must match parameter.yml keys)
+    type: string
+  - name: adoEnvironment             # Azure DevOps environment (deployment history, optional checks)
+    type: string
+  - name: workspaceId
+    type: string
+  - name: dependsOn
+    type: object
+    default: [Build]
+  # -- approval gate --
+  - name: requireApproval
+    type: boolean
+    default: false
+  - name: approvers                  # comma-separated emails or [Project]\Group
+    type: string
+    default: ''
+  - name: allowSelfApproval          # may the person who triggered the run approve it?
+    type: boolean
+    default: false
+  - name: approvalTimeoutMinutes     # unanswered gate is rejected after this; keep below 4320 (job limit)
+    type: string                     # string: values passed from pipeline variables are strings
+    default: '1440'
+  - name: approvalInstructions
+    type: string
+    default: 'Approve to deploy.'
+  # -- post-deploy test --
+  - name: postDeployItemName         # '' = skip
+    type: string
+    default: ''
+  - name: postDeployItemType         # DataPipeline | Notebook
+    type: string
+    default: DataPipeline
+  - name: postDeployTimeoutMinutes   # run_item.py fails the step after this; keep below 340
+    type: string
+    default: '60'
+  # -- misc --
+  - name: removeDeletedItems
+    type: boolean
+    default: false
+  - name: debugLogging
+    type: boolean
+    default: false
+  - name: tagRelease
+    type: boolean
+    default: false
+  - name: fabricFolder
+    type: string
+    default: workspace
+  - name: artifactName
+    type: string
+    default: fabric-items
+  - name: agentImage
+    type: string
+    default: ubuntu-latest
+  - name: pythonVersion
+    type: string
+    default: '3.11'
+
+stages:
+  - stage: Deploy_${{ parameters.envName }}
+    displayName: Deploy to ${{ parameters.envName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: succeeded()
+    jobs:
+      # ------------------------------------------------------------ approval gate
+      - ${{ if eq(parameters.requireApproval, true) }}:
+        - job: Approval
+          displayName: Approval gate - ${{ parameters.envName }}
+          pool: server                                   # agentless: uses no agent while waiting
+          timeoutInMinutes: 4320                         # 3 days; must exceed approvalTimeoutMinutes
+          steps:
+            - task: ManualValidation@1
+              timeoutInMinutes: ${{ parameters.approvalTimeoutMinutes }}
+              inputs:
+                notifyUsers: ${{ parameters.approvers }}
+                approvers: ${{ parameters.approvers }}
+                allowApproversToApproveTheirOwnRuns: ${{ parameters.allowSelfApproval }}
+                instructions: ${{ parameters.approvalInstructions }}
+                onTimeout: reject
+
+      # ------------------------------------------------------------ deploy
+      - deployment: Publish
+        displayName: Deploy to ${{ parameters.envName }}
+        ${{ if eq(parameters.requireApproval, true) }}:
+          dependsOn: Approval
+        environment: ${{ parameters.adoEnvironment }}
+        timeoutInMinutes: 0      # agent maximum (360 min on Microsoft-hosted) - room for the post-deploy test
+        pool:
+          vmImage: ${{ parameters.agentImage }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: ${{ parameters.artifactName }}
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: ${{ parameters.pythonVersion }}
+
+                - script: pip install -r "$(Pipeline.Workspace)/${{ parameters.artifactName }}/requirements.txt"
+                  displayName: Install dependencies
+
+                - script: >
+                    python "$(Pipeline.Workspace)/${{ parameters.artifactName }}/scripts/deploy.py"
+                    --workspace-id "${{ parameters.workspaceId }}"
+                    --environment ${{ parameters.envName }}
+                    --repo-dir "$(Pipeline.Workspace)/${{ parameters.artifactName }}/${{ parameters.fabricFolder }}"
+                    --remove-deleted-items ${{ parameters.removeDeletedItems }}
+                    --debug ${{ parameters.debugLogging }}
+                  displayName: Preflight, deploy, smoke check
+                  env:   # secrets must be mapped explicitly
+                    AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+                    AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+                    AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+
+                - ${{ if ne(parameters.postDeployItemName, '') }}:
+                  - script: >
+                      python "$(Pipeline.Workspace)/${{ parameters.artifactName }}/scripts/run_item.py"
+                      --workspace-id "${{ parameters.workspaceId }}"
+                      --item-name "${{ parameters.postDeployItemName }}"
+                      --item-type ${{ parameters.postDeployItemType }}
+                      --timeout-minutes ${{ parameters.postDeployTimeoutMinutes }}
+                    displayName: Post-deploy test - run ${{ parameters.postDeployItemName }}
+                    env:
+                      AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+                      AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+                      AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+
+                - ${{ if eq(parameters.tagRelease, true) }}:
+                  # Needs "<Project> Build Service" to have Contribute + Create tag on the repo.
+                  - checkout: self
+                    persistCredentials: true
+                    fetchDepth: 0
+                  - script: |
+                      set -e
+                      TAG="release/$(Build.BuildNumber)"
+                      if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+                        echo "Tag $TAG already exists (stage re-run) - nothing to do."; exit 0
+                      fi
+                      git config user.email "$(Build.RequestedForEmail)"
+                      git config user.name "$(Build.RequestedFor)"
+                      git tag -a "$TAG" "$(Build.SourceVersion)" -m "${{ parameters.envName }} release $(Build.BuildNumber)"
+                      git push origin "$TAG"
+                    workingDirectory: $(Build.SourcesDirectory)
+                    displayName: Tag the released commit

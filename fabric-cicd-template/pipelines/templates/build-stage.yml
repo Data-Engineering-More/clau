@@ -1,0 +1,131 @@
+# =============================================================================
+#  Build stage - shared by pr-validation.yml and cd-pipeline.yml
+# =============================================================================
+#  Nothing here touches a Fabric workspace. Each check is its own step so a failure
+#  shows exactly which check broke; results also appear in the run's "Tests" tab.
+#
+#    1. PR branch rules         (PR runs only)  main <- develop/hotfix; develop <- feature/fix/hotfix
+#    2. Pipeline config check   (CD runs only)  workspace IDs real & distinct, approvers set
+#    3. Static validation       items, JSON, parameter.yml, references, GUIDs, secrets, notebook syntax
+#    4. Offline dry-run deploy  real fabric-cicd against a fake workspace per environment
+#    5. Publish test results    JUnit -> Tests tab (always runs)
+#    6. Package artefact        (CD runs only)  the exact files every Deploy stage uses
+#  No values to change in this file - set them in the calling pipeline.
+# =============================================================================
+
+parameters:
+  - name: publishArtifact          # CD: true, PR: false
+    type: boolean
+    default: true
+  - name: checkPrBranches          # enforce branch flow on pull requests
+    type: boolean
+    default: false
+  - name: configCheckArgs          # arguments for scripts/check_config.py ('' = skip)
+    type: string
+    default: ''
+  - name: dryRunEnvironments       # environments to dry-run (keys in parameter.yml)
+    type: object
+    default: [TEST, PROD]
+  - name: sourceWorkspaceId        # extra ID that must not survive deployment ('' = none)
+    type: string
+    default: ''
+  - name: fabricFolder
+    type: string
+    default: workspace
+  - name: artifactName
+    type: string
+    default: fabric-items
+  - name: agentImage
+    type: string
+    default: ubuntu-latest
+  - name: pythonVersion
+    type: string
+    default: '3.11'
+
+stages:
+  - stage: Build
+    displayName: Validate and package
+    jobs:
+      - job: Validate
+        displayName: Validate Fabric items
+        pool:
+          vmImage: ${{ parameters.agentImage }}
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: ${{ parameters.pythonVersion }}
+
+          - script: pip install -r requirements.txt
+            displayName: Install dependencies
+
+          # 1 ---------------------------------------------------------------
+          - ${{ if eq(parameters.checkPrBranches, true) }}:
+            - script: |
+                SRC="$(System.PullRequest.SourceBranch)"; SRC="${SRC#refs/heads/}"
+                TGT="$(System.PullRequest.TargetBranch)"; TGT="${TGT#refs/heads/}"
+                echo "PR: $SRC -> $TGT"
+                ok=1
+                case "$TGT" in
+                  main)    case "$SRC" in develop|hotfix/*) ;; *) ok=0 ;; esac ;;
+                  develop) case "$SRC" in feature/*|fix/*|bugfix/*|hotfix/*|main) ;; *) ok=0 ;; esac ;;
+                esac
+                if [ "$ok" = 0 ]; then
+                  echo "##vso[task.logissue type=error]Branch rule: '$SRC' may not merge into '$TGT'. main accepts develop or hotfix/*; develop accepts feature/*, fix/*, bugfix/*, hotfix/* or main."
+                  exit 1
+                fi
+                if ! echo "$SRC" | grep -Eq '^(develop|main|(feature|fix|bugfix|hotfix)/[0-9]+-[a-z0-9._-]+)$'; then
+                  echo "##vso[task.logissue type=warning]Branch name '$SRC' does not follow <type>/<work-item-id>-<short-desc>."
+                fi
+                echo "Branch rules OK."
+              displayName: 1. PR branch rules
+              condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+          # 2 ---------------------------------------------------------------
+          - ${{ if ne(parameters.configCheckArgs, '') }}:
+            - script: python scripts/check_config.py ${{ parameters.configCheckArgs }}
+              displayName: 2. Pipeline config check
+
+          # 3 ---------------------------------------------------------------
+          - script: >
+              python scripts/validate.py
+              --repo-dir "${{ parameters.fabricFolder }}"
+              --junit "$(Common.TestResultsDirectory)/validate.xml"
+            displayName: 3. Static validation
+
+          # 4 ---------------------------------------------------------------
+          - script: >
+              python scripts/dry_run.py
+              --repo-dir "${{ parameters.fabricFolder }}"
+              --environments ${{ join(' ', parameters.dryRunEnvironments) }}
+              --source-workspace-id "${{ parameters.sourceWorkspaceId }}"
+              --junit "$(Common.TestResultsDirectory)/dry-run.xml"
+            displayName: 4. Offline dry-run deploy
+
+          # 5 ---------------------------------------------------------------
+          - task: PublishTestResults@2
+            displayName: 5. Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: '*.xml'
+              searchFolder: $(Common.TestResultsDirectory)
+              testRunTitle: Fabric validation
+              failTaskOnFailedTests: false   # the steps above already fail the build
+
+          # 6 ---------------------------------------------------------------
+          - ${{ if eq(parameters.publishArtifact, true) }}:
+            - task: CopyFiles@2
+              displayName: 6a. Stage artefact
+              inputs:
+                SourceFolder: $(Build.SourcesDirectory)
+                Contents: |
+                  ${{ parameters.fabricFolder }}/**
+                  scripts/**
+                  requirements.txt
+                TargetFolder: $(Build.ArtifactStagingDirectory)
+
+            - publish: $(Build.ArtifactStagingDirectory)
+              artifact: ${{ parameters.artifactName }}
+              displayName: 6b. Publish artefact
