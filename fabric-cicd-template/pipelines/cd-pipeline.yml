@@ -71,6 +71,14 @@ variables:
   - name: prodWorkspaceId
     value: '<PROD_WORKSPACE_ID>'
 
+  # >>> CHANGE: which environments are live. To test with DEV only, set both to 'false':
+  #     the run does Build + DEV, and TEST/PROD settings are not checked or deployed.
+  #     Switch TEST on once that workspace exists, then PROD (PROD requires TEST).
+  - name: enableTest
+    value: 'true'
+  - name: enableProd
+    value: 'true'
+
   # >>> CHANGE: approval gates. 'true' = the run waits until one approver approves.
   #     Approvers: comma-separated emails and/or groups as [ProjectName]\Group Name.
   #     KEEP THE SINGLE QUOTES - a value starting with [ is otherwise read as a YAML list.
@@ -134,11 +142,15 @@ stages:
         --workspace "DEV=${{ variables.devWorkspaceId }}"
         --workspace "TEST=${{ variables.testWorkspaceId }}"
         --workspace "PROD=${{ variables.prodWorkspaceId }}"
-        ${{ iif(eq(variables.testApprovalGate, 'true'), format('--approvers "TEST={0}"', variables.testApprovers), '') }}
-        ${{ iif(eq(variables.prodApprovalGate, 'true'), format('--approvers "PROD={0}"', variables.prodApprovers), '') }}
+        --enabled DEV
+        ${{ iif(eq(variables.enableTest, 'true'), '--enabled TEST', '') }}
+        ${{ iif(eq(variables.enableProd, 'true'), '--enabled PROD', '') }}
+        ${{ iif(and(eq(variables.enableTest, 'true'), eq(variables.testApprovalGate, 'true')), format('--approvers "TEST={0}"', variables.testApprovers), '') }}
+        ${{ iif(and(eq(variables.enableProd, 'true'), eq(variables.prodApprovalGate, 'true')), format('--approvers "PROD={0}"', variables.prodApprovers), '') }}
 
   # ---------------------------------------------------------------- main: DEV -> TEST -> PROD
   # Manual runs from any other branch stop after Build (validation only).
+  # TEST / PROD stages are only included when enableTest / enableProd are 'true'.
   - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
     - template: templates/deploy-stage.yml
       parameters:
@@ -155,40 +167,42 @@ stages:
         agentImage: ${{ variables.agentImage }}
         pythonVersion: ${{ variables.pythonVersion }}
 
-    - template: templates/deploy-stage.yml
-      parameters:
-        envName: TEST
-        adoEnvironment: ${{ variables.projectSlug }}-test
-        workspaceId: ${{ variables.testWorkspaceId }}
-        dependsOn: [Deploy_DEV]
-        requireApproval: ${{ eq(variables.testApprovalGate, 'true') }}
-        approvers: ${{ variables.testApprovers }}
-        allowSelfApproval: ${{ eq(variables.allowSelfApproval, 'true') }}
-        approvalTimeoutMinutes: ${{ variables.approvalTimeoutMinutes }}
-        approvalInstructions: 'Run $(Build.BuildNumber) is deployed to DEV. Check the DEV workspace and the release preview on the Summary tab. Approve to deploy to TEST.'
-        postDeployItemName: ${{ variables.testPostDeployItem }}
-        postDeployItemType: ${{ variables.postDeployItemType }}
-        postDeployTimeoutMinutes: ${{ variables.postDeployTimeoutMinutes }}
-        removeDeletedItems: ${{ parameters.removeDeletedItems }}
-        debugLogging: ${{ parameters.debugLogging }}
-        fabricFolder: ${{ variables.fabricFolder }}
-        agentImage: ${{ variables.agentImage }}
-        pythonVersion: ${{ variables.pythonVersion }}
+    - ${{ if eq(variables.enableTest, 'true') }}:
+      - template: templates/deploy-stage.yml
+        parameters:
+          envName: TEST
+          adoEnvironment: ${{ variables.projectSlug }}-test
+          workspaceId: ${{ variables.testWorkspaceId }}
+          dependsOn: [Deploy_DEV]
+          requireApproval: ${{ eq(variables.testApprovalGate, 'true') }}
+          approvers: ${{ variables.testApprovers }}
+          allowSelfApproval: ${{ eq(variables.allowSelfApproval, 'true') }}
+          approvalTimeoutMinutes: ${{ variables.approvalTimeoutMinutes }}
+          approvalInstructions: 'Run $(Build.BuildNumber) is deployed to DEV. Check the DEV workspace and the release preview on the Summary tab. Approve to deploy to TEST.'
+          postDeployItemName: ${{ variables.testPostDeployItem }}
+          postDeployItemType: ${{ variables.postDeployItemType }}
+          postDeployTimeoutMinutes: ${{ variables.postDeployTimeoutMinutes }}
+          removeDeletedItems: ${{ parameters.removeDeletedItems }}
+          debugLogging: ${{ parameters.debugLogging }}
+          fabricFolder: ${{ variables.fabricFolder }}
+          agentImage: ${{ variables.agentImage }}
+          pythonVersion: ${{ variables.pythonVersion }}
 
-    - template: templates/deploy-stage.yml
-      parameters:
-        envName: PROD
-        adoEnvironment: ${{ variables.projectSlug }}-prod
-        workspaceId: ${{ variables.prodWorkspaceId }}
-        dependsOn: [Deploy_TEST]
-        requireApproval: ${{ eq(variables.prodApprovalGate, 'true') }}
-        approvers: ${{ variables.prodApprovers }}
-        allowSelfApproval: ${{ eq(variables.allowSelfApproval, 'true') }}
-        approvalTimeoutMinutes: ${{ variables.approvalTimeoutMinutes }}
-        approvalInstructions: 'Run $(Build.BuildNumber) is live in TEST. Approve only after UAT sign-off (and CAB if required) to deploy to PROD.'
-        removeDeletedItems: ${{ parameters.removeDeletedItems }}
-        debugLogging: ${{ parameters.debugLogging }}
-        tagRelease: true
-        fabricFolder: ${{ variables.fabricFolder }}
-        agentImage: ${{ variables.agentImage }}
-        pythonVersion: ${{ variables.pythonVersion }}
+    - ${{ if and(eq(variables.enableTest, 'true'), eq(variables.enableProd, 'true')) }}:
+      - template: templates/deploy-stage.yml
+        parameters:
+          envName: PROD
+          adoEnvironment: ${{ variables.projectSlug }}-prod
+          workspaceId: ${{ variables.prodWorkspaceId }}
+          dependsOn: [Deploy_TEST]
+          requireApproval: ${{ eq(variables.prodApprovalGate, 'true') }}
+          approvers: ${{ variables.prodApprovers }}
+          allowSelfApproval: ${{ eq(variables.allowSelfApproval, 'true') }}
+          approvalTimeoutMinutes: ${{ variables.approvalTimeoutMinutes }}
+          approvalInstructions: 'Run $(Build.BuildNumber) is live in TEST. Approve only after UAT sign-off (and CAB if required) to deploy to PROD.'
+          removeDeletedItems: ${{ parameters.removeDeletedItems }}
+          debugLogging: ${{ parameters.debugLogging }}
+          tagRelease: true
+          fabricFolder: ${{ variables.fabricFolder }}
+          agentImage: ${{ variables.agentImage }}
+          pythonVersion: ${{ variables.pythonVersion }}

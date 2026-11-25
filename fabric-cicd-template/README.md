@@ -84,6 +84,7 @@ feature/1234-desc ──PR──▶ main ──▶ Build ──▶ DEV ──▶
 | `group:` | `vargrp-fabric-deploy` | The variable group from step 2 below |
 | `projectSlug` | `sales-reporting` | Lower case, no spaces. Used for environment names, run names and tags |
 | `devWorkspaceId` / `testWorkspaceId` / `prodWorkspaceId` | `'xxxxxxxx-…'` | The GUID after `/groups/` in the Fabric address bar. Keep the quotes |
+| `enableTest` / `enableProd` | `'true'` | `'false'` = that environment isn't checked or deployed. **Start with both `'false'` to test with DEV only**; switch TEST on, then PROD, once the workspaces exist. PROD requires TEST |
 | `testApprovalGate` / `prodApprovalGate` | `'true'` | `'false'` removes that gate |
 | `testApprovers` / `prodApprovers` | `'a@org.com, [MyProject]\Release Approvers'` | Emails and/or Azure DevOps groups. **Keep the single quotes** |
 | `allowSelfApproval` | `'false'` | `'false'` = whoever merged can't approve. Teams of 2–3: set `'true'` or list two or more approvers |
@@ -131,6 +132,9 @@ feature/1234-desc ──PR──▶ main ──▶ Build ──▶ DEV ──▶
    - One project per workspace at a time; commit before switching branches.
 
 ## 3. First-run test plan
+
+**Only have the DEV workspace so far?** Set `devWorkspaceId`, `enableTest: 'false'` and `enableProd: 'false'`. Leave the TEST/PROD values as placeholders. Each merge then runs Build → DEV only, and you can do rows 1–5 below. Later, fill in the TEST workspace and approvers, set `enableTest: 'true'`, and continue from row 6. Then do the same for PROD. Until PROD is on, no release tag exists, so the release preview compares against the full history.
+
 
 | # | Do | Expect |
 |---|---|---|
