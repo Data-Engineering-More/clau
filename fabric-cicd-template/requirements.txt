@@ -1,0 +1,5 @@
+# Pinned on purpose: read the fabric-cicd changelog before bumping, then re-run the dry run.
+fabric-cicd==1.2.0
+azure-identity>=1.15
+pyyaml>=6.0
+requests>=2.31

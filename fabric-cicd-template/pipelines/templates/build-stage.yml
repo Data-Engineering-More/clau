@@ -1,0 +1,153 @@
+# =============================================================================
+#  Build stage - shared by pr-validation.yml and cd-pipeline.yml
+# =============================================================================
+#  Nothing here touches a Fabric workspace. Each check is its own step so a failure
+#  shows exactly which check broke; results also appear in the run's Tests and Summary tabs.
+#
+#    1. PR branch rules         (PR runs)  main accepts feature/*, fix/*, bugfix/*, hotfix/*
+#    2. Pipeline config check   (CD runs)  workspace IDs real and distinct, approvers set
+#    3. Static validation       items, JSON, parameter.yml, references, GUIDs, secrets, notebook syntax
+#    4. Offline dry-run deploy  real fabric-cicd against a fake workspace per environment
+#    5. Release preview         items + commits + work items changing (Summary tab)
+#    6. Publish test results    JUnit -> Tests tab (always runs)
+#    7. Package artefact        (CD runs)  the exact files every Deploy stage uses
+#  No values to change in this file - set them in the calling pipeline.
+# =============================================================================
+
+parameters:
+  - name: publishArtifact          # CD: true, PR: false
+    type: boolean
+    default: true
+  - name: checkPrBranches          # enforce branch flow on pull requests
+    type: boolean
+    default: false
+  - name: releaseBranch            # the trunk
+    type: string
+    default: main
+  - name: configCheckArgs          # arguments for scripts/check_config.py ('' = skip)
+    type: string
+    default: ''
+  - name: dryRunEnvironments       # environments to dry-run (keys in parameter.yml)
+    type: object
+    default: [DEV, TEST, PROD]
+  - name: sourceWorkspaceId        # extra ID that must not survive deployment ('' = none)
+    type: string
+    default: ''
+  - name: releasePreviewMode       # release (CD) | pr (PR) | none
+    type: string
+    default: release
+    values: [release, pr, none]
+  - name: fabricFolder
+    type: string
+    default: workspace
+  - name: artifactName
+    type: string
+    default: fabric-items
+  - name: agentImage
+    type: string
+    default: ubuntu-latest
+  - name: pythonVersion
+    type: string
+    default: '3.11'
+
+stages:
+  - stage: Build
+    displayName: Validate and package
+    jobs:
+      - job: Validate
+        displayName: Validate Fabric items
+        pool:
+          vmImage: ${{ parameters.agentImage }}
+        steps:
+          - checkout: self
+            fetchDepth: 0          # full history + tags for the release preview
+            fetchTags: true
+
+          - task: UsePythonVersion@0
+            displayName: Use Python ${{ parameters.pythonVersion }}
+            inputs:
+              versionSpec: ${{ parameters.pythonVersion }}
+
+          - script: |
+              python -m pip install --upgrade pip --quiet --disable-pip-version-check
+              pip install -r requirements.txt --disable-pip-version-check
+              echo "Installed:"; pip show fabric-cicd azure-identity | grep -E "^(Name|Version)"
+            displayName: Install dependencies
+
+          # 1 ---------------------------------------------------------------
+          - ${{ if eq(parameters.checkPrBranches, true) }}:
+            - script: |
+                SRC="$(System.PullRequest.SourceBranch)"; SRC="${SRC#refs/heads/}"
+                TGT="$(System.PullRequest.TargetBranch)"; TGT="${TGT#refs/heads/}"
+                echo "Pull request: $SRC -> $TGT"
+                if [ "$TGT" = "${{ parameters.releaseBranch }}" ]; then
+                  case "$SRC" in
+                    feature/*|fix/*|bugfix/*|hotfix/*) ;;
+                    *) echo "##vso[task.logissue type=error]Branch rule: '$SRC' may not merge into '$TGT'. Use feature/*, fix/*, bugfix/* or hotfix/*."
+                       exit 1 ;;
+                  esac
+                fi
+                if ! echo "$SRC" | grep -Eq '^(feature|fix|bugfix|hotfix)/[0-9]+-[a-z0-9._-]+$'; then
+                  echo "##vso[task.logissue type=warning]Branch name '$SRC' does not follow <type>/<work-item-id>-<short-desc>, e.g. feature/1234-add-ratings."
+                fi
+                echo "Branch rules OK."
+              displayName: 1. PR branch rules
+              condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+          # 2 ---------------------------------------------------------------
+          - ${{ if ne(parameters.configCheckArgs, '') }}:
+            - script: python scripts/check_config.py ${{ parameters.configCheckArgs }}
+              displayName: 2. Pipeline config check
+
+          # 3 ---------------------------------------------------------------
+          - script: >
+              python scripts/validate.py
+              --repo-dir "${{ parameters.fabricFolder }}"
+              --junit "$(Common.TestResultsDirectory)/validate.xml"
+            displayName: 3. Static validation
+
+          # 4 ---------------------------------------------------------------
+          - script: >
+              python scripts/dry_run.py
+              --repo-dir "${{ parameters.fabricFolder }}"
+              --environments ${{ join(' ', parameters.dryRunEnvironments) }}
+              --source-workspace-id "${{ parameters.sourceWorkspaceId }}"
+              --junit "$(Common.TestResultsDirectory)/dry-run.xml"
+            displayName: 4. Offline dry-run deploy
+
+          # 5 ---------------------------------------------------------------
+          - ${{ if ne(parameters.releasePreviewMode, 'none') }}:
+            - script: >
+                python scripts/release_preview.py
+                --fabric-folder "${{ parameters.fabricFolder }}"
+                --mode ${{ parameters.releasePreviewMode }}
+                --output "$(Agent.TempDirectory)/release-preview.md"
+              displayName: 5. Release preview (see Summary tab)
+              continueOnError: true      # informational - never blocks a release
+
+          # 6 ---------------------------------------------------------------
+          - task: PublishTestResults@2
+            displayName: 6. Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: '*.xml'
+              searchFolder: $(Common.TestResultsDirectory)
+              testRunTitle: Fabric validation
+              failTaskOnFailedTests: false   # the steps above already fail the build
+
+          # 7 ---------------------------------------------------------------
+          - ${{ if eq(parameters.publishArtifact, true) }}:
+            - task: CopyFiles@2
+              displayName: 7a. Stage artefact
+              inputs:
+                SourceFolder: $(Build.SourcesDirectory)
+                Contents: |
+                  ${{ parameters.fabricFolder }}/**
+                  scripts/**
+                  requirements.txt
+                TargetFolder: $(Build.ArtifactStagingDirectory)
+
+            - publish: $(Build.ArtifactStagingDirectory)
+              artifact: ${{ parameters.artifactName }}
+              displayName: 7b. Publish artefact

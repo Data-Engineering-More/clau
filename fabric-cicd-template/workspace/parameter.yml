@@ -1,0 +1,92 @@
+# =============================================================================
+#  parameter.yml - environment-specific values for fabric-cicd  (TEMPLATE)
+# =============================================================================
+#  Put this file in the root of your Fabric Git folder (the "fabricFolder" variable
+#  in azure-pipelines.yml, default: workspace/).
+#
+#  On every deployment fabric-cicd finds each "find_value" in the item files and
+#  replaces it with the value for the target environment (DEV / TEST / PROD - these
+#  keys must match the --environment values used in azure-pipelines.yml).
+#
+#  Dynamic values you can use on the right-hand side:
+#    $workspace.$id                          ID of the workspace being deployed to
+#    $items.<Type>.<Item Name>.$id           ID of that item in the target workspace
+#    $items.Lakehouse.<Name>.$sqlendpoint    SQL endpoint of a lakehouse in the target
+#
+#  The Build stage fails while any <PLACEHOLDER> below is still present (comments are
+#  ignored), so you can't deploy a half-filled file by accident.
+#
+#  WHERE TO FIND THE DEV IDs
+#    Open any notebook folder in the repo -> notebook-content.py -> the "# META" block
+#    near the top:  "default_lakehouse": "<lakehouse id>",
+#                   "default_lakehouse_workspace_id": "<workspace id>"
+# =============================================================================
+
+find_replace:
+  # ---------------------------------------------------------------------------
+  # 1. Notebook default lakehouse -> the lakehouse with the same name in the target.
+  #    Regex, so it works whichever workspace the developer attached the lakehouse in.
+  #    >>> CHANGE: <LAKEHOUSE_NAME> = display name of your lakehouse (exact, case-sensitive).
+  # ---------------------------------------------------------------------------
+  - find_value: '\#\s*META\s+"default_lakehouse":\s*"([0-9a-fA-F-]{36})"'
+    is_regex: "true"
+    item_type: "Notebook"
+    replace_value:
+      DEV: "$items.Lakehouse.<LAKEHOUSE_NAME>.$id"
+      TEST: "$items.Lakehouse.<LAKEHOUSE_NAME>.$id"
+      PROD: "$items.Lakehouse.<LAKEHOUSE_NAME>.$id"
+
+  # ---------------------------------------------------------------------------
+  # 2. Notebook default lakehouse workspace -> the target workspace. No change needed.
+  # ---------------------------------------------------------------------------
+  - find_value: '\#\s*META\s+"default_lakehouse_workspace_id":\s*"([0-9a-fA-F-]{36})"'
+    is_regex: "true"
+    item_type: "Notebook"
+    replace_value:
+      DEV: "$workspace.$id"
+      TEST: "$workspace.$id"
+      PROD: "$workspace.$id"
+
+  # ---------------------------------------------------------------------------
+  # 3. Any other reference to the Dev lakehouse ID (known_lakehouses, abfss paths,
+  #    pipeline JSON).
+  #    >>> CHANGE: <DEV_LAKEHOUSE_ID> = the Dev lakehouse GUID; <LAKEHOUSE_NAME> as above.
+  # ---------------------------------------------------------------------------
+  - find_value: "<DEV_LAKEHOUSE_ID>"
+    replace_value:
+      DEV: "$items.Lakehouse.<LAKEHOUSE_NAME>.$id"
+      TEST: "$items.Lakehouse.<LAKEHOUSE_NAME>.$id"
+      PROD: "$items.Lakehouse.<LAKEHOUSE_NAME>.$id"
+
+  # ---------------------------------------------------------------------------
+  # 4. Any other reference to the Dev workspace ID.
+  #    >>> CHANGE: <DEV_WORKSPACE_ID> = the Dev workspace GUID.
+  # ---------------------------------------------------------------------------
+  - find_value: "<DEV_WORKSPACE_ID>"
+    replace_value:
+      DEV: "$workspace.$id"
+      TEST: "$workspace.$id"
+      PROD: "$workspace.$id"
+
+  # ---------------------------------------------------------------------------
+  # 5. OPTIONAL - a connection used by a Data Pipeline (e.g. SharePoint, SQL, REST).
+  #    Connections are NOT deployed: create one per environment
+  #    (Settings -> Manage connections and gateways), share it with the deployment
+  #    service principal, then uncomment and fill the IDs.
+  # ---------------------------------------------------------------------------
+  # - find_value: "<DEV_CONNECTION_ID>"
+  #   replace_value:
+  #     DEV: "<DEV_CONNECTION_ID>"
+  #     TEST: "<TEST_CONNECTION_ID>"
+  #     PROD: "<PROD_CONNECTION_ID>"
+
+  # ---------------------------------------------------------------------------
+  # 6. OPTIONAL - notebooks that read a lakehouse in ANOTHER workspace
+  #    (abfss://<workspace-id>@onelake...). Map that workspace per environment.
+  #    The Build stage warns about any GUID in your code that no rule covers.
+  # ---------------------------------------------------------------------------
+  # - find_value: "<DEV_SOURCE_WORKSPACE_ID>"
+  #   replace_value:
+  #     DEV: "<DEV_SOURCE_WORKSPACE_ID>"
+  #     TEST: "<TEST_SOURCE_WORKSPACE_ID>"
+  #     PROD: "<PROD_SOURCE_WORKSPACE_ID>"

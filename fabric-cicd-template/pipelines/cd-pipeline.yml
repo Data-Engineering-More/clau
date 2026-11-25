@@ -1,0 +1,194 @@
+# =============================================================================
+#  Microsoft Fabric - CD pipeline (trunk-based)                       TEMPLATE
+# =============================================================================
+#
+#   feature/* --PR--> main ==> Build ==> DEV ==> [approve] TEST ==> [approve] PROD ==> tag
+#
+#   Build : config check, static validation, offline dry run, release preview, artefact
+#   DEV   : deploys automatically after every merge into main
+#   TEST  : waits until an approver confirms DEV is fine, then deploys
+#   PROD  : waits for a second approval (after UAT / CAB), deploys the SAME artefact, tags it
+#
+#   Every stage logs step by step; the Summary tab shows the release preview and a deployment
+#   report per environment; full logs are kept as "logs-<ENV>-<attempt>" artefacts.
+#
+#  SET UP
+#    1. Search this file for ">>> CHANGE" and set every value.
+#    2. Fill in workspace/parameter.yml.
+#    3. In Azure DevOps create the variable group and the three environments (README).
+#    4. New pipeline -> Existing YAML -> /pipelines/cd-pipeline.yml -> Validate -> Save.
+# =============================================================================
+
+name: $(projectSlug)_$(Date:yyyy.MM.dd)$(Rev:.r)   # run name; also the release tag release/<name>
+
+# >>> CHANGE (optional): trunk branch name. If not "main", change it here, in the
+#     "refs/heads/main" line under stages, and in pr-validation.yml.
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - README.md
+
+pr: none   # PR runs come from pr-validation.yml via branch policy
+
+# Two merges close together: with an "Exclusive lock" check on the environments, only the
+# newest run proceeds; older runs waiting for the same environment are cancelled.
+lockBehavior: runLatest
+
+# Options shown under "Run pipeline"
+parameters:
+  - name: removeDeletedItems
+    displayName: Remove items deleted from the repo (Notebooks/Pipelines only - lakehouses are never deleted)
+    type: boolean
+    default: false
+  - name: debugLogging
+    displayName: Verbose fabric-cicd logging
+    type: boolean
+    default: false
+
+# =============================================================================
+#  CONFIGURE ME
+# =============================================================================
+variables:
+  # >>> CHANGE: variable group (Pipelines -> Library) with AZURE_TENANT_ID, AZURE_CLIENT_ID and
+  #     AZURE_CLIENT_SECRET (secret) for a service principal that is Contributor on all three
+  #     workspaces.
+  - group: vargrp-fabric-deploy
+
+  # >>> CHANGE: short project name - lower case, no spaces. Used for the run name, release tag
+  #     and Azure DevOps environment names: <slug>-dev, <slug>-test, <slug>-prod.
+  - name: projectSlug
+    value: my-fabric-project
+
+  # >>> CHANGE: Fabric workspace IDs - the GUID after /groups/ in the browser address bar.
+  #     Keep the quotes. The Build stage fails while these are placeholders or if two match.
+  - name: devWorkspaceId
+    value: '<DEV_WORKSPACE_ID>'
+  - name: testWorkspaceId
+    value: '<TEST_WORKSPACE_ID>'
+  - name: prodWorkspaceId
+    value: '<PROD_WORKSPACE_ID>'
+
+  # >>> CHANGE: approval gates. 'true' = the run waits until one approver approves.
+  #     Approvers: comma-separated emails and/or groups as [ProjectName]\Group Name.
+  #     KEEP THE SINGLE QUOTES - a value starting with [ is otherwise read as a YAML list.
+  #     The Build stage fails if a gate is on and its approvers are still placeholders.
+  - name: testApprovalGate
+    value: 'true'
+  - name: testApprovers
+    value: '<TEST_APPROVERS>'
+  - name: prodApprovalGate
+    value: 'true'
+  - name: prodApprovers
+    value: '<PROD_APPROVERS>'
+  #     May the person whose merge triggered the run approve it? 'false' = four-eyes rule.
+  #     With 2-3 people, set 'true' or list at least two approvers per gate.
+  - name: allowSelfApproval
+    value: 'false'
+  #     Minutes a gate waits before it is rejected (max 4200 = ~3 days). A rejected or
+  #     timed-out stage can be started again later with "Rerun stage" - same artefact.
+  - name: approvalTimeoutMinutes
+    value: '4200'
+
+  # >>> CHANGE (optional): post-deploy test - a Data Pipeline or Notebook to run after the
+  #     deploy; the stage fails if that run fails. '' = off. It writes data like a normal
+  #     run - only use an item that is safe to run in that environment.
+  - name: devPostDeployItem
+    value: ''
+  - name: testPostDeployItem
+    value: ''
+  - name: postDeployItemType               # DataPipeline | Notebook
+    value: DataPipeline
+  - name: postDeployTimeoutMinutes         # max 330
+    value: '60'
+
+  # >>> CHANGE (optional): repo folder Fabric Git integration syncs to; parameter.yml lives here.
+  #     Keep the same value in pr-validation.yml.
+  - name: fabricFolder
+    value: workspace
+
+  # >>> CHANGE (optional): agent. For a self-hosted pool replace "vmImage:" with "name: <pool>"
+  #     in both templates. Agents need Python, git and HTTPS to api.fabric.microsoft.com,
+  #     api.powerbi.com and login.microsoftonline.com.
+  - name: agentImage
+    value: ubuntu-latest
+  - name: pythonVersion
+    value: '3.11'
+
+# =============================================================================
+#  STAGES - no changes needed below
+# =============================================================================
+stages:
+  # ---------------------------------------------------------------- Build (every run)
+  - template: templates/build-stage.yml
+    parameters:
+      publishArtifact: true
+      releasePreviewMode: release
+      fabricFolder: ${{ variables.fabricFolder }}
+      agentImage: ${{ variables.agentImage }}
+      pythonVersion: ${{ variables.pythonVersion }}
+      sourceWorkspaceId: ${{ variables.devWorkspaceId }}
+      configCheckArgs: >-
+        --workspace "DEV=${{ variables.devWorkspaceId }}"
+        --workspace "TEST=${{ variables.testWorkspaceId }}"
+        --workspace "PROD=${{ variables.prodWorkspaceId }}"
+        ${{ iif(eq(variables.testApprovalGate, 'true'), format('--approvers "TEST={0}"', variables.testApprovers), '') }}
+        ${{ iif(eq(variables.prodApprovalGate, 'true'), format('--approvers "PROD={0}"', variables.prodApprovers), '') }}
+
+  # ---------------------------------------------------------------- main: DEV -> TEST -> PROD
+  # Manual runs from any other branch stop after Build (validation only).
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+    - template: templates/deploy-stage.yml
+      parameters:
+        envName: DEV
+        adoEnvironment: ${{ variables.projectSlug }}-dev
+        workspaceId: ${{ variables.devWorkspaceId }}
+        dependsOn: [Build]
+        postDeployItemName: ${{ variables.devPostDeployItem }}
+        postDeployItemType: ${{ variables.postDeployItemType }}
+        postDeployTimeoutMinutes: ${{ variables.postDeployTimeoutMinutes }}
+        removeDeletedItems: ${{ parameters.removeDeletedItems }}
+        debugLogging: ${{ parameters.debugLogging }}
+        fabricFolder: ${{ variables.fabricFolder }}
+        agentImage: ${{ variables.agentImage }}
+        pythonVersion: ${{ variables.pythonVersion }}
+
+    - template: templates/deploy-stage.yml
+      parameters:
+        envName: TEST
+        adoEnvironment: ${{ variables.projectSlug }}-test
+        workspaceId: ${{ variables.testWorkspaceId }}
+        dependsOn: [Deploy_DEV]
+        requireApproval: ${{ eq(variables.testApprovalGate, 'true') }}
+        approvers: ${{ variables.testApprovers }}
+        allowSelfApproval: ${{ eq(variables.allowSelfApproval, 'true') }}
+        approvalTimeoutMinutes: ${{ variables.approvalTimeoutMinutes }}
+        approvalInstructions: 'Run $(Build.BuildNumber) is deployed to DEV. Check the DEV workspace and the release preview on the Summary tab. Approve to deploy to TEST.'
+        postDeployItemName: ${{ variables.testPostDeployItem }}
+        postDeployItemType: ${{ variables.postDeployItemType }}
+        postDeployTimeoutMinutes: ${{ variables.postDeployTimeoutMinutes }}
+        removeDeletedItems: ${{ parameters.removeDeletedItems }}
+        debugLogging: ${{ parameters.debugLogging }}
+        fabricFolder: ${{ variables.fabricFolder }}
+        agentImage: ${{ variables.agentImage }}
+        pythonVersion: ${{ variables.pythonVersion }}
+
+    - template: templates/deploy-stage.yml
+      parameters:
+        envName: PROD
+        adoEnvironment: ${{ variables.projectSlug }}-prod
+        workspaceId: ${{ variables.prodWorkspaceId }}
+        dependsOn: [Deploy_TEST]
+        requireApproval: ${{ eq(variables.prodApprovalGate, 'true') }}
+        approvers: ${{ variables.prodApprovers }}
+        allowSelfApproval: ${{ eq(variables.allowSelfApproval, 'true') }}
+        approvalTimeoutMinutes: ${{ variables.approvalTimeoutMinutes }}
+        approvalInstructions: 'Run $(Build.BuildNumber) is live in TEST. Approve only after UAT sign-off (and CAB if required) to deploy to PROD.'
+        removeDeletedItems: ${{ parameters.removeDeletedItems }}
+        debugLogging: ${{ parameters.debugLogging }}
+        tagRelease: true
+        fabricFolder: ${{ variables.fabricFolder }}
+        agentImage: ${{ variables.agentImage }}
+        pythonVersion: ${{ variables.pythonVersion }}
