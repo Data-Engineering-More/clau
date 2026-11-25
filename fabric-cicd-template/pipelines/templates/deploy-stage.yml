@@ -1,20 +1,20 @@
 # =============================================================================
 #  Deploy stage - one per environment, called by cd-pipeline.yml
 # =============================================================================
-#    Gate         Approval job (agentless ManualValidation) when requireApproval = true.
-#                 Named approvers get an email; the run waits; reject or timeout = stop.
-#    Preflight    service principal can open the workspace; workspace is on a capacity
-#    Deploy       fabric-cicd publish with parameter.yml applied
-#    Smoke check  every repo item now exists in the workspace
+#    Gate         OPTIONAL approval job (agentless ManualValidation). Named approvers get an
+#                 email; the run waits; reject or timeout = stage fails (can be re-run later).
+#    Deploy       preflight -> plan -> fabric-cicd publish -> optional clean-up -> smoke check
+#                 Each phase is a section in the log; fabric-cicd output is a collapsible group.
 #    Post-deploy  OPTIONAL: run a pipeline/notebook in the workspace and wait for success
-#    Tag          OPTIONAL (PROD): tag the released commit
+#    Logs         deploy report on the Summary tab + "logs-<ENV>-<attempt>" artefact
+#    Tag          OPTIONAL (PROD): tag the released commit release/<run name>
 #  No values to change in this file - set them in cd-pipeline.yml.
 # =============================================================================
 
 parameters:
   - name: envName                    # DEV | TEST | PROD (must match parameter.yml keys)
     type: string
-  - name: adoEnvironment             # Azure DevOps environment (deployment history, optional checks)
+  - name: adoEnvironment             # Azure DevOps environment (deployment history, exclusive lock)
     type: string
   - name: workspaceId
     type: string
@@ -28,12 +28,12 @@ parameters:
   - name: approvers                  # comma-separated emails or [Project]\Group
     type: string
     default: ''
-  - name: allowSelfApproval          # may the person who triggered the run approve it?
+  - name: allowSelfApproval
     type: boolean
     default: false
-  - name: approvalTimeoutMinutes     # unanswered gate is rejected after this; keep below 4320 (job limit)
-    type: string                     # string: values passed from pipeline variables are strings
-    default: '1440'
+  - name: approvalTimeoutMinutes     # unanswered gate is rejected after this; max 4200 (job limit below)
+    type: string
+    default: '4200'
   - name: approvalInstructions
     type: string
     default: 'Approve to deploy.'
@@ -44,7 +44,7 @@ parameters:
   - name: postDeployItemType         # DataPipeline | Notebook
     type: string
     default: DataPipeline
-  - name: postDeployTimeoutMinutes   # run_item.py fails the step after this; keep below 340
+  - name: postDeployTimeoutMinutes   # keep below 330 (Microsoft-hosted job limit 360)
     type: string
     default: '60'
   # -- misc --
@@ -72,18 +72,19 @@ parameters:
 
 stages:
   - stage: Deploy_${{ parameters.envName }}
-    displayName: Deploy to ${{ parameters.envName }}
+    displayName: ${{ parameters.envName }}
     dependsOn: ${{ parameters.dependsOn }}
     condition: succeeded()
     jobs:
       # ------------------------------------------------------------ approval gate
       - ${{ if eq(parameters.requireApproval, true) }}:
         - job: Approval
-          displayName: Approval gate - ${{ parameters.envName }}
-          pool: server                                   # agentless: uses no agent while waiting
-          timeoutInMinutes: 4320                         # 3 days; must exceed approvalTimeoutMinutes
+          displayName: Approve ${{ parameters.envName }}
+          pool: server                    # agentless: uses no agent while waiting
+          timeoutInMinutes: 4320          # 3 days; must exceed approvalTimeoutMinutes
           steps:
             - task: ManualValidation@1
+              displayName: Waiting for approval
               timeoutInMinutes: ${{ parameters.approvalTimeoutMinutes }}
               inputs:
                 notifyUsers: ${{ parameters.approvers }}
@@ -93,7 +94,7 @@ stages:
                 onTimeout: reject
 
       # ------------------------------------------------------------ deploy
-      - deployment: Publish
+      - deployment: Deploy
         displayName: Deploy to ${{ parameters.envName }}
         ${{ if eq(parameters.requireApproval, true) }}:
           dependsOn: Approval
@@ -107,39 +108,64 @@ stages:
               steps:
                 - download: current
                   artifact: ${{ parameters.artifactName }}
+                  displayName: Download artefact
 
                 - task: UsePythonVersion@0
+                  displayName: Use Python ${{ parameters.pythonVersion }}
                   inputs:
                     versionSpec: ${{ parameters.pythonVersion }}
 
-                - script: pip install -r "$(Pipeline.Workspace)/${{ parameters.artifactName }}/requirements.txt"
+                - script: |
+                    python -m pip install --upgrade pip --quiet --disable-pip-version-check
+                    pip install -r "$(Pipeline.Workspace)/${{ parameters.artifactName }}/requirements.txt" --disable-pip-version-check
+                    mkdir -p "$(Pipeline.Workspace)/logs"
                   displayName: Install dependencies
 
-                - script: >
-                    python "$(Pipeline.Workspace)/${{ parameters.artifactName }}/scripts/deploy.py"
-                    --workspace-id "${{ parameters.workspaceId }}"
-                    --environment ${{ parameters.envName }}
-                    --repo-dir "$(Pipeline.Workspace)/${{ parameters.artifactName }}/${{ parameters.fabricFolder }}"
-                    --remove-deleted-items ${{ parameters.removeDeletedItems }}
-                    --debug ${{ parameters.debugLogging }}
-                  displayName: Preflight, deploy, smoke check
+                - script: |
+                    set -o pipefail
+                    cd "$(Pipeline.Workspace)/logs"      # fabric-cicd writes its error log here
+                    echo "Run:         $(Build.BuildNumber)"
+                    echo "Commit:      $(Build.SourceVersion)"
+                    echo "Environment: ${{ parameters.envName }}"
+                    echo "Workspace:   ${{ parameters.workspaceId }}"
+                    python "$(Pipeline.Workspace)/${{ parameters.artifactName }}/scripts/deploy.py" \
+                      --workspace-id "${{ parameters.workspaceId }}" \
+                      --environment ${{ parameters.envName }} \
+                      --repo-dir "$(Pipeline.Workspace)/${{ parameters.artifactName }}/${{ parameters.fabricFolder }}" \
+                      --remove-deleted-items ${{ parameters.removeDeletedItems }} \
+                      --debug ${{ parameters.debugLogging }} \
+                      --summary-file "$(Pipeline.Workspace)/logs/deploy-${{ parameters.envName }}.md" \
+                      2>&1 | tee "$(Pipeline.Workspace)/logs/deploy-${{ parameters.envName }}.log"
+                  displayName: Deploy to ${{ parameters.envName }} (preflight, publish, smoke check)
                   env:   # secrets must be mapped explicitly
                     AZURE_TENANT_ID: $(AZURE_TENANT_ID)
                     AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
                     AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+                    PYTHONUNBUFFERED: '1'
 
                 - ${{ if ne(parameters.postDeployItemName, '') }}:
-                  - script: >
-                      python "$(Pipeline.Workspace)/${{ parameters.artifactName }}/scripts/run_item.py"
-                      --workspace-id "${{ parameters.workspaceId }}"
-                      --item-name "${{ parameters.postDeployItemName }}"
-                      --item-type ${{ parameters.postDeployItemType }}
-                      --timeout-minutes ${{ parameters.postDeployTimeoutMinutes }}
+                  - script: |
+                      set -o pipefail
+                      python "$(Pipeline.Workspace)/${{ parameters.artifactName }}/scripts/run_item.py" \
+                        --workspace-id "${{ parameters.workspaceId }}" \
+                        --item-name "${{ parameters.postDeployItemName }}" \
+                        --item-type ${{ parameters.postDeployItemType }} \
+                        --timeout-minutes ${{ parameters.postDeployTimeoutMinutes }} \
+                        --environment ${{ parameters.envName }} \
+                        --summary-file "$(Pipeline.Workspace)/logs/post-deploy-${{ parameters.envName }}.md" \
+                        2>&1 | tee "$(Pipeline.Workspace)/logs/post-deploy-${{ parameters.envName }}.log"
                     displayName: Post-deploy test - run ${{ parameters.postDeployItemName }}
                     env:
                       AZURE_TENANT_ID: $(AZURE_TENANT_ID)
                       AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
                       AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+                      PYTHONUNBUFFERED: '1'
+
+                - publish: $(Pipeline.Workspace)/logs
+                  artifact: logs-${{ parameters.envName }}-$(System.JobAttempt)
+                  displayName: Publish deployment logs
+                  condition: succeededOrFailed()
+                  continueOnError: true
 
                 - ${{ if eq(parameters.tagRelease, true) }}:
                   # Needs "<Project> Build Service" to have Contribute + Create tag on the repo.
@@ -156,5 +182,7 @@ stages:
                       git config user.name "$(Build.RequestedFor)"
                       git tag -a "$TAG" "$(Build.SourceVersion)" -m "${{ parameters.envName }} release $(Build.BuildNumber)"
                       git push origin "$TAG"
+                      echo "##vso[build.addbuildtag]released"
+                      echo "Tagged $(Build.SourceVersion) as $TAG"
                     workingDirectory: $(Build.SourcesDirectory)
                     displayName: Tag the released commit

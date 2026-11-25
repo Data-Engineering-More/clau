@@ -1,71 +1,98 @@
-# Microsoft Fabric CI/CD template for Azure DevOps
+# Microsoft Fabric CI/CD template for Azure DevOps (trunk-based)
 
-Deploys Microsoft Fabric items (Lakehouse, Notebooks, Data Pipelines) across **DEV → TEST → PROD** with Microsoft's [`fabric-cicd`](https://microsoft.github.io/fabric-cicd/) library. It has validation at every stage and approval gates before TEST and PROD.
+Deploys Microsoft Fabric items (Lakehouse, Notebooks, Data Pipelines) to **DEV → TEST → PROD** using Microsoft's [`fabric-cicd`](https://microsoft.github.io/fabric-cicd/) library. There is one long-lived branch (`main`), an approval gate before TEST and before PROD, and step-by-step logging.
 
 ```
-feature/*  ──PR──▶ develop ──▶ Build ──▶ DEV
-                     ▲ pr-validation runs on every PR
-develop    ──PR──▶ main    ──▶ Build ──▶ [gate] ──▶ TEST ──▶ [gate] ──▶ PROD ──▶ tag
-hotfix/*   ──PR──▶ main    ──▶ same, then merge main back into develop
+feature/1234-desc ──PR──▶ main ──▶ Build ──▶ DEV ──▶ [approve] TEST ──▶ [approve] PROD ──▶ tag
+       ▲                    │       automatic   automatic   "DEV is fine"      "UAT signed off"
+       └ developer's own    └ pr-validation runs on every PR (never deploys)
+         Fabric workspace
 ```
+
+## How a release works
+
+1. A developer works in **their own Fabric workspace** on `feature/<work-item>-<desc>`, created from `main`.
+2. They raise a **PR into `main`**. `pr-validation` checks it, and the PR's Summary tab lists the Fabric items and commits it changes.
+3. After review, they squash-merge. **`cd-pipeline` starts automatically:**
+   - **Build** validates, dry-runs, and writes the **release preview** to the Summary tab: everything changed since the last PROD release.
+   - **DEV** deploys automatically.
+   - The **TEST gate** emails the TEST approvers. The run waits while you check the DEV workspace.
+   - **Approve** → TEST deploys. Then the **PROD gate** emails the PROD approvers.
+   - **Approve** (after UAT/CAB) → PROD deploys **the same artefact**, and the commit is tagged `release/<run name>`.
+4. **Reject** at either gate to stop. Fix the problem with a new PR, which starts a new run.
+
+**Hotfix:** same flow, on a branch named `hotfix/<id>-<desc>`.
+**Rollback:** revert the bad merge commit on `main` with a PR. The pipeline redeploys the previous code (code only, not data).
 
 ## Files
 
 ```
-<your-repo>/                         copy the contents of this folder to your repo root
+<your-repo>/
 ├── pipelines/
-│   ├── cd-pipeline.yml              deploys: develop → DEV, main → TEST → PROD.  ← CONFIGURE ME block
-│   ├── pr-validation.yml            PR checks only, never deploys
+│   ├── cd-pipeline.yml            main → DEV → [gate] TEST → [gate] PROD → tag.   ← CONFIGURE ME
+│   ├── pr-validation.yml          PR checks only, never deploys, no secrets
 │   └── templates/
-│       ├── build-stage.yml          validation + packaging (shared by both pipelines)
-│       └── deploy-stage.yml         gate → preflight → deploy → smoke → post-deploy test → tag
+│       ├── build-stage.yml        validation, dry run, release preview, artefact
+│       └── deploy-stage.yml       gate → deploy (5 logged phases) → post-deploy test → logs → tag
 ├── scripts/
-│   ├── validate.py                  static checks on the Fabric items
-│   ├── dry_run.py                   offline deploy against a fake workspace
-│   ├── check_config.py              sanity-checks the pipeline settings
-│   ├── deploy.py                    preflight + fabric-cicd publish + smoke check
-│   └── run_item.py                  runs a pipeline/notebook after deploy and waits for success
-├── requirements.txt                 fabric-cicd pinned to 1.2.0
-└── workspace/                       ← your Fabric Git folder
-    ├── parameter.yml                DEV → TEST/PROD ID mapping                    ← fill in
-    └── <your items>.Lakehouse / .Notebook / .DataPipeline
+│   ├── pipeline_log.py            log sections, collapsible groups, Summary-tab reports, run tags
+│   ├── validate.py                static checks on the Fabric items
+│   ├── dry_run.py                 offline deploy with the real fabric-cicd against a fake workspace
+│   ├── check_config.py            pipeline settings: workspace IDs real and distinct, approvers set
+│   ├── release_preview.py         what's changing since the last PROD release (or in a PR)
+│   ├── deploy.py                  preflight → plan → publish → clean-up → smoke check, with report
+│   └── run_item.py                optional: run a pipeline/notebook after deploy and wait for success
+├── requirements.txt               fabric-cicd pinned to 1.2.0
+└── workspace/                     ← Fabric Git folder
+    ├── parameter.yml              DEV → TEST/PROD ID mapping                          ← fill in
+    └── <items>.Lakehouse / .Notebook / .DataPipeline
 ```
 
-## Validation and gates: what runs where
+## What you see in Azure DevOps (logging)
 
-| # | Check | PR | develop → DEV | main → TEST/PROD | Fails on |
-|---|---|:-:|:-:|:-:|---|
-| 1 | **Branch rules** | ✅ | | | `main` only accepts `develop`/`hotfix/*`; `develop` accepts `feature/*`, `fix/*`, `bugfix/*`, `hotfix/*`, `main`. Warns on names not like `feature/123-desc` |
-| 2 | **Config check** | | ✅ | ✅ | Workspace IDs not real GUIDs; **two environments sharing a workspace**; a gate on with no approvers |
-| 3 | **Static validation** (7 checks) | ✅ | ✅ | ✅ | Missing/invalid `.platform`; `/` in names; duplicate names or logicalIds (copied folders); invalid JSON; `parameter.yml` gaps, bad regex, placeholders; pipeline activity pointing at a deleted notebook; **committed secrets** (keys, SAS, passwords, private keys). Warns on unmapped GUIDs and notebook syntax errors |
-| 4 | **Offline dry-run deploy** | ✅ | ✅ | ✅ | Real `fabric-cicd` deploys to a fake TEST and PROD workspace. Fails if `fabric-cicd` rejects anything, **any DEV ID survives**, a notebook's lakehouse doesn't point at the target, or an item isn't published |
-| 5 | Test results → **Tests tab** | ✅ | ✅ | ✅ | — |
-| 6 | **Approval gate** | | | ✅ TEST and PROD | Rejected, or nobody approves within `approvalTimeoutMinutes` |
-| 7 | **Preflight** | | ✅ | ✅ | Service principal can't open the workspace, or it has no capacity |
-| 8 | **Deploy + smoke check** | | ✅ | ✅ | Any repo item missing in the workspace afterwards |
-| 9 | **Post-deploy test** (optional) | | | ✅ TEST | The chosen pipeline/notebook fails, is cancelled or times out in TEST |
-| 10 | Release tag | | | ✅ PROD | — |
+| Where | What |
+|---|---|
+| **Stage view** | `Build` → `DEV` → `TEST` (Approve / Deploy) → `PROD` (Approve / Deploy). Waiting gates show **Review**, with the instructions and Approve/Reject buttons |
+| **Step log** | Each deploy is split into green sections: `1/5 Preflight`, `2/5 Deployment plan` (a table of every item: Create, Update or Skip), `3/5 Publish` (fabric-cicd output, collapsible), `4/5 Remove deleted items`, `5/5 Smoke check` (a table with OK/MISSING). Every line is timestamped |
+| **Summary tab** | Release preview (items, commits, work items, warnings), then one report per environment: result, duration, and the item table with Create/Update and OK/MISSING |
+| **Tests tab** | Static validation and dry-run results, one test per check or environment |
+| **Warnings/errors** | Shown at the top of the run, e.g. *"'X.Notebook' is deleted in this release"*, *"commit abc123 has no linked work item"* |
+| **Artefacts** | `logs-DEV-1`, `logs-TEST-1`, `logs-PROD-1`: the full deploy log, the report, and fabric-cicd's error log if it failed |
+| **Run tags** | `deployed-dev`, `deployed-test`, `deployed-prod`, `released`. Filter the runs list by these |
+| **Environments page** | Deployment history per environment: which run and commit is in DEV, TEST and PROD right now |
 
-PROD always deploys the **same artefact** that passed TEST.
+## Validation: what runs where
+
+| Check | PR | Merge to main | Fails on |
+|---|:-:|:-:|---|
+| Branch rules | ✅ | | Only `feature/*`, `fix/*`, `bugfix/*` and `hotfix/*` can merge into `main`. Warns if the name has no work-item ID |
+| Config check | | ✅ | Workspace IDs are placeholders, not GUIDs, or **two environments share a workspace**; a gate is on with no approvers |
+| Static validation | ✅ | ✅ | Bad `.platform`; `/` in a name; duplicate names or IDs; invalid JSON; `parameter.yml` gaps or placeholders; a pipeline calling a deleted notebook; **committed secrets**. Warns on unmapped GUIDs and notebook syntax errors |
+| Offline dry run | ✅ | ✅ | fabric-cicd rejects anything, **a DEV ID survives**, a notebook isn't re-pointed, or an item isn't published |
+| Release preview | ✅ | ✅ | Never fails; informational |
+| Approval gates | | ✅ | Rejected, or not answered within the timeout |
+| Preflight | | ✅ | Service principal can't open the workspace, or it isn't on a capacity |
+| Smoke check | | ✅ | Any repo item missing in the workspace after deploy |
+| Post-deploy test (optional) | | ✅ | The chosen pipeline/notebook fails, is cancelled or times out |
 
 ## 1. Configure
 
-### `pipelines/cd-pipeline.yml`: the `CONFIGURE ME` block
-Search for `>>> CHANGE`.
+### `pipelines/cd-pipeline.yml`: the `CONFIGURE ME` block (search `>>> CHANGE`)
 
-| Setting | Example | Where to find it |
+| Setting | Example | Notes |
 |---|---|---|
-| `group:` | `vargrp-fabric-deploy` | The variable group you create in step 2 |
-| `projectSlug` | `sales-reporting` | Your choice: lower case, no spaces |
-| `devWorkspaceId` / `testWorkspaceId` / `prodWorkspaceId` | `'xxxxxxxx-xxxx-…'` | Open the workspace in Fabric; it's the GUID after `/groups/` in the address bar |
-| `testApprovalGate` / `prodApprovalGate` | `'true'` | `'false'` turns that gate off |
+| `group:` | `vargrp-fabric-deploy` | The variable group from step 2 below |
+| `projectSlug` | `sales-reporting` | Lower case, no spaces. Used for environment names, run names and tags |
+| `devWorkspaceId` / `testWorkspaceId` / `prodWorkspaceId` | `'xxxxxxxx-…'` | The GUID after `/groups/` in the Fabric address bar. Keep the quotes |
+| `testApprovalGate` / `prodApprovalGate` | `'true'` | `'false'` removes that gate |
 | `testApprovers` / `prodApprovers` | `'a@org.com, [MyProject]\Release Approvers'` | Emails and/or Azure DevOps groups. **Keep the single quotes** |
-| `allowSelfApproval` | `'false'` | `'false'` = the person who triggered the run can't approve it. Teams of 2–3: set `'true'` or list several approvers |
-| `approvalTimeoutMinutes` | `1440` | Unanswered gate is rejected after this (max 4320) |
-| `testPostDeployItem` (optional) | `'PL_Main'` | A pipeline or notebook that is **safe to run in TEST**. `''` = off |
-| `fabricFolder`, `agentImage`, `pythonVersion` | defaults | Change only if needed. Keep `pr-validation.yml` in sync |
+| `allowSelfApproval` | `'false'` | `'false'` = whoever merged can't approve. Teams of 2–3: set `'true'` or list two or more approvers |
+| `approvalTimeoutMinutes` | `'4200'` | Gate rejects after this (max 4200, about 3 days). Later, use **Rerun stage** on the rejected stage; it redeploys the same artefact |
+| `devPostDeployItem` / `testPostDeployItem` | `'PL_Main'` | Optional: a pipeline or notebook to run after deploy, **only if safe to run there**. `''` = off |
+| `fabricFolder`, `agentImage`, `pythonVersion` | defaults | Keep `pr-validation.yml` in sync |
 
 ### `workspace/parameter.yml`
+
 | Placeholder | Where to find it |
 |---|---|
 | `<LAKEHOUSE_NAME>` | Lakehouse display name exactly as in Fabric |
@@ -73,71 +100,62 @@ Search for `>>> CHANGE`.
 | `<DEV_WORKSPACE_ID>` | Same file → `"default_lakehouse_workspace_id": "…"` |
 | Blocks 5–6 (optional) | Connections, or lakehouses in other workspaces |
 
-### `scripts/deploy.py` and `scripts/validate.py` (optional)
-`ITEM_TYPES` (item types to deploy), `EXCLUDE_REGEX` (names never deployed, default `*_dev`), and `ENVIRONMENTS` (must match the `parameter.yml` keys).
+### Scripts (optional)
+- `deploy.py`: `ITEM_TYPES` (item types to deploy) and `EXCLUDE_REGEX` (names never deployed; default `*_dev`).
+- `validate.py`: `ENVIRONMENTS` must match the `parameter.yml` keys.
 
-## 2. One-time setup in Azure DevOps and Fabric
+## 2. One-time setup
 
 1. **Service principal.**
    - Create an app registration and a client secret.
-   - Fabric admin portal: enable *Service principals can use Fabric APIs* for a group that contains it.
-   - Make it **Contributor** on all three workspaces.
+   - Fabric admin portal: enable *Service principals can use Fabric APIs* for a security group that contains it.
+   - Make it **Contributor** on the DEV, TEST and PROD workspaces.
 2. **Variable group** (Pipelines → Library): `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` 🔒.
-3. **Environments** (Pipelines → Environments): `<projectSlug>-dev`, `-test`, `-prod`. Add an **Exclusive lock** check on each, so two runs can't deploy at once.
+3. **Environments** (Pipelines → Environments): `<projectSlug>-dev`, `-test`, `-prod`.
+   - On each, go to Approvals and checks → **Exclusive lock**. With `lockBehavior: runLatest`, if two merges overlap only the newest run deploys.
 4. **Pipelines.**
-   - New pipeline → Existing YAML → `/pipelines/cd-pipeline.yml`.
-   - New pipeline → `/pipelines/pr-validation.yml`.
-   - Click **Validate** in the editor for each, then Save.
-   - On the first run, authorise the variable group and environments.
-5. **Branch policies on `develop` and `main`.**
+   - New pipeline → Azure Repos Git → Existing YAML → `/pipelines/cd-pipeline.yml`. Click **Validate**, then Save. Rename it `cd-pipeline`.
+   - Same again for `/pipelines/pr-validation.yml`, renamed `pr-validation`.
+5. **Branch policy on `main`.**
    - Require a PR; minimum 1 reviewer; linked work item; comment resolution.
    - **Build validation = `pr-validation`, required.**
-   - Merge type: squash into `develop`; **merge commit (no fast-forward)** into `main`.
+   - Merge type: **squash** (one commit per change, so the release preview stays readable).
 6. **Repo permissions.**
    - Developers: Contribute and Create branch.
-   - *<Project> Build Service*: Contribute and **Create tag**.
+   - *<Project> Build Service*: **Contribute** and **Create tag**.
 7. **Seed once.**
-   - Connect the existing DEV workspace to `develop` (Git folder = `fabricFolder`), commit all items, then merge into `main`.
-   - **Disconnect DEV from Git.** The pipeline deploys it from then on.
+   - Connect the current DEV workspace to `main` (Git folder = `fabricFolder`) and commit all items.
+   - **Disconnect DEV from Git.** From then on the pipeline deploys DEV.
+8. **Developers.**
+   - Each developer connects their own workspace (not "My workspace") to this repo: Git folder = `fabricFolder`, branch = their feature branch.
+   - One project per workspace at a time; commit before switching branches.
 
-### About the approval gates
-The gates are written in YAML (an agentless `ManualValidation@1` job), so they're visible and reviewed like code. Approvers get an email and approve from the run page. You can *also* add an **Approvals** check on the `-test`/`-prod` environments in the Azure DevOps UI. That check is enforced even if someone edits the YAML, but it means two approvals per stage. Pick one, or both for PROD.
+## 3. First-run test plan
 
-## 3. Test it end to end (first run)
-
-| Step | Do | Expect |
+| # | Do | Expect |
 |---|---|---|
-| 1 | Run `pr-validation` manually on a feature branch (step 1 only runs on real PRs) | Steps 3–5 green; results in the **Tests** tab |
-| 2 | Raise a PR `feature/…` → `develop` | `pr-validation` runs as a required check |
-| 3 | Try a PR `feature/…` → `main` | Blocked by the branch rule |
-| 4 | Merge the PR into `develop` | Build, then `Deploy_DEV`: preflight OK, items published, smoke check OK |
-| 5 | Raise and merge a PR `develop` → `main` | Build, then the **TEST gate** emails the approvers |
-| 6 | Approve | TEST deploys (and the post-deploy test runs if set) |
-| 7 | **PROD gate** emails the approvers. Reject it once to see a clean stop, then re-run the stage and approve | PROD deploys and the tag `release/<slug>_<date>.<n>` appears |
-| 8 | Check each workspace | Notebooks point at that workspace's own lakehouse |
+| 1 | Run `pr-validation` manually on any branch | Steps 3–6 green; results on the **Tests** tab (the branch rule only runs on real PRs) |
+| 2 | PR `feature/1-pipeline-test` → `main` with a small notebook change | `pr-validation` runs as a required check; the PR run's Summary shows 1 modified item |
+| 3 | Try a PR from a branch called `test` | Blocked by the branch rule |
+| 4 | Merge the PR | Build → **DEV deploys by itself**. Check the log sections, the Summary-tab report and the `logs-DEV-1` artefact |
+| 5 | Open the DEV workspace | The change is there, and notebooks point at the DEV lakehouse |
+| 6 | The run shows **TEST: Review**. **Reject** it | Run stops cleanly; TEST unchanged |
+| 7 | On the same run, **Rerun stage** TEST → Approve | TEST deploys the same artefact |
+| 8 | Approve PROD | PROD deploys; tag `release/<run name>` appears in Repos → Tags; run tagged `released` |
+| 9 | Merge another small PR | The release preview now compares with that tag and lists only the new change |
 
-**Things to try on purpose to prove the checks work:**
-- Leave a placeholder in `parameter.yml`.
-- Paste a fake `AccountKey=…` into a notebook.
-- Set `prodWorkspaceId` to the TEST ID.
-- Delete a notebook that a pipeline still calls.
+**Break it on purpose** to prove the checks:
+- Put `prodWorkspaceId` = the TEST ID.
+- Leave `<TEST_APPROVERS>` unfilled.
+- Paste `AccountKey=abcdefghijklmnopqrstuvwxyz0123456789` into a notebook.
+- Delete a notebook that the pipeline still calls.
+- Remove a rule from `parameter.yml`.
 
-Each one should fail the Build stage with a clear message.
-
-## 4. Daily workflow
-
-Developers work in their **own** Fabric workspace, connected to the repo:
-1. Create `feature/<work-item-id>-<desc>` from `develop`.
-2. In the workspace: Source control → Branches → **Switch branch** (commit first).
-3. Attach notebooks to the **DEV** lakehouse.
-4. Commit, then raise a PR into `develop`. Once merged, DEV deploys.
-
-**Release:** PR `develop` → `main`, then TEST gate, TEST, UAT, PROD gate, PROD.
-**Hotfix:** branch from `main` → PR into `main` → then merge `main` into `develop`.
-**Rollback:** revert the release merge commit on `main` with a PR. TEST and PROD redeploy the previous code. Data is not rolled back.
+Each must fail Build with a clear message.
 
 ## Good to know
-- **Not deployed:** lakehouse data, connections, schedules and permissions. Run your pipeline once after the first deploy to each workspace.
-- **Lakehouses are never deleted**, even with *Remove items deleted from the repo* on.
+- **Not deployed:** lakehouse data, connections, schedules and permissions. Run your pipeline once after the first deploy to each workspace, and set schedules there.
+- **Lakehouses are never deleted**, even with *Remove items deleted from the repo*.
+- **No hand edits:** don't edit DEV, TEST or PROD by hand. The next deployment overwrites portal changes.
+- **Overlapping merges:** if two merges land before PROD is approved, approve the **newest** run; it contains both changes.
 - **Dry-run limits:** it simulates the Fabric API for Lakehouse, Notebook and Data Pipeline items. If you add item types or bump `fabric-cicd` and it reports *calls the dry run does not simulate*, extend `FakeFabric` in `dry_run.py`.
-- **No hand edits:** nobody edits DEV, TEST or PROD by hand. The next deployment overwrites portal changes.

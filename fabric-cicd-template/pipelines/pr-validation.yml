@@ -1,15 +1,15 @@
 # =============================================================================
 #  Microsoft Fabric - PR validation pipeline (never deploys)          TEMPLATE
 # =============================================================================
-#  Add as a required Build Validation branch policy on BOTH develop and main:
-#    Repos -> Branches -> develop/main -> ... -> Branch policies -> Build validation -> + -> this pipeline
+#  Add as a required Build Validation branch policy on main:
+#    Repos -> Branches -> main -> ... -> Branch policies -> Build validation -> + -> this pipeline
 #
-#  Runs on every PR update:
-#    1. branch rules  (main <- develop or hotfix/*; develop <- feature/*, fix/*, bugfix/*, hotfix/*, main)
-#    3. static validation of the Fabric items and parameter.yml
-#    4. offline dry-run deploy to fake TEST and PROD workspaces
-#    5. results in the PR's Tests tab
-#  No secrets and no Fabric access needed.
+#  Runs on every PR update, needs no secrets and no Fabric access:
+#    1. branch rules       main accepts feature/*, fix/*, bugfix/*, hotfix/*
+#    3. static validation  Fabric items and parameter.yml
+#    4. offline dry run    real fabric-cicd against fake DEV, TEST and PROD workspaces
+#    5. PR preview         Fabric items and commits in this PR (Summary tab)
+#    6. results            Tests tab of the PR run
 # =============================================================================
 
 trigger: none
@@ -17,6 +17,8 @@ pr: none   # Azure Repos uses the branch policy, not this setting
 
 variables:
   # >>> CHANGE (optional): keep these the same as in cd-pipeline.yml.
+  - name: releaseBranch
+    value: main
   - name: fabricFolder
     value: workspace
   - name: agentImage
@@ -29,6 +31,8 @@ stages:
     parameters:
       publishArtifact: false
       checkPrBranches: true
+      releaseBranch: ${{ variables.releaseBranch }}
+      releasePreviewMode: pr
       fabricFolder: ${{ variables.fabricFolder }}
       agentImage: ${{ variables.agentImage }}
       pythonVersion: ${{ variables.pythonVersion }}
